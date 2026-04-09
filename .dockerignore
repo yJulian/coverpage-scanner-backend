@@ -1,0 +1,8 @@
+# .dockerignore
+target/
+models/
+.git/
+.gemini/
+.gitignore
+Dockerfile
+API_SPEC.md

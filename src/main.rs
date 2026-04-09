@@ -3,25 +3,28 @@ mod ocr;
 mod pipeline;
 mod room_manager;
 
+use crate::models::room::UserInfo;
+use crate::models::{ScanResponse, StudentInfo};
+use crate::ocr::{LocalOcrProvider, MockOcrProvider, OcrProvider};
+use crate::pipeline::steps::{ImagePreProcessor, OcrScanner, QrCodeScanner};
+use crate::pipeline::{Context, ScannerPipeline};
+use crate::room_manager::RoomManager;
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, State, ws::{WebSocket, WebSocketUpgrade, Message}},
+    Json, Router,
+    extract::{
+        DefaultBodyLimit, Multipart, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::IntoResponse,
-    routing::{post, get},
-    Json, Router,
+    routing::{get, post},
 };
-use crate::models::{ScanResponse, StudentInfo};
-use crate::models::room::{UserInfo};
-use crate::pipeline::{Context, ScannerPipeline};
-use crate::pipeline::steps::{ImagePreProcessor, OcrScanner, QrCodeScanner};
-use crate::ocr::{LocalOcrProvider, OcrProvider, MockOcrProvider};
-use crate::room_manager::RoomManager;
+use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::sync::Arc;
 use uuid::Uuid;
-use futures_util::{StreamExt, SinkExt};
-use tokio::sync::mpsc;
 
 struct AppState {
     ocr_provider: Arc<dyn OcrProvider>,
@@ -38,8 +41,13 @@ async fn main() {
     let ocr_provider = match LocalOcrProvider::new("models") {
         Ok(p) => Arc::new(p) as Arc<dyn OcrProvider>,
         Err(e) => {
-            tracing::error!("Failed to initialize OCR provider: {}. Using Mock for development.", e);
-            Arc::new(MockOcrProvider { text: "Mock OCR Result".into() })
+            tracing::error!(
+                "Failed to initialize OCR provider: {}. Using Mock for development.",
+                e
+            );
+            Arc::new(MockOcrProvider {
+                text: "Mock OCR Result".into(),
+            })
         }
     };
 
@@ -79,10 +87,19 @@ async fn create_room_handler(
     // In a full implementation, the user would connect via WS right after this
     // We create a temporary dummy channel for the creation step
     let user_id = Uuid::new_v4();
-    let (tx, _rx) = mpsc::unbounded_channel(); 
-    let code = state.room_manager.create_room(UserInfo { id: user_id, name: payload.user_name }, tx);
-    
-    (StatusCode::CREATED, Json(CreateRoomResponse { code, user_id }))
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let code = state.room_manager.create_room(
+        UserInfo {
+            id: user_id,
+            name: payload.user_name,
+        },
+        tx,
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(CreateRoomResponse { code, user_id }),
+    )
 }
 
 async fn ws_handler(
@@ -96,9 +113,12 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, code: String, state: Arc<AppState>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    
+
     let user_id = Uuid::new_v4();
-    let user_info = UserInfo { id: user_id, name: format!("User-{}", &user_id.to_string()[..4]) };
+    let user_info = UserInfo {
+        id: user_id,
+        name: format!("User-{}", &user_id.to_string()[..4]),
+    };
 
     // Task to send messages from our channel to the WebSocket
     let mut send_task = tokio::spawn(async move {
@@ -116,7 +136,7 @@ async fn handle_socket(socket: WebSocket, code: String, state: Arc<AppState>) {
     }
 
     let code_clone = code.clone();
-    
+
     // Task to receive messages from the WebSocket (can handle approval, chat, etc)
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -140,7 +160,7 @@ async fn handle_socket(socket: WebSocket, code: String, state: Arc<AppState>) {
 
 async fn scan_handler(
     State(state): State<Arc<AppState>>,
-    mut multipart: Multipart
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut image_data = None;
 
@@ -155,18 +175,30 @@ async fn scan_handler(
     }
 
     let Some(image_data) = image_data else {
-        return (StatusCode::BAD_REQUEST, Json(ScanResponse::Error("No image provided".into()))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ScanResponse::Error("No image provided".into())),
+        )
+            .into_response();
     };
 
     let image = match image::load_from_memory(&image_data) {
         Ok(img) => img,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(ScanResponse::Error(format!("Invalid image: {}", e)))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ScanResponse::Error(format!("Invalid image: {}", e))),
+            )
+                .into_response();
+        }
     };
 
     let pipeline = ScannerPipeline::new()
         .add_step(Box::new(ImagePreProcessor))
         .add_step(Box::new(QrCodeScanner))
-        .add_step(Box::new(OcrScanner { provider: state.ocr_provider.clone() }));
+        .add_step(Box::new(OcrScanner {
+            provider: state.ocr_provider.clone(),
+        }));
 
     let context = Context::new(image);
     match pipeline.run(context) {
@@ -180,12 +212,20 @@ async fn scan_handler(
                 (StatusCode::OK, Json(ScanResponse::Success(info))).into_response()
             } else {
                 let missing = ctx.get_missing_fields();
-                (StatusCode::OK, Json(ScanResponse::Partial {
-                    info: ctx.partial_info,
-                    missing,
-                })).into_response()
+                (
+                    StatusCode::OK,
+                    Json(ScanResponse::Partial {
+                        info: ctx.partial_info,
+                        missing,
+                    }),
+                )
+                    .into_response()
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ScanResponse::Error(format!("Pipeline error: {}", e)))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ScanResponse::Error(format!("Pipeline error: {}", e))),
+        )
+            .into_response(),
     }
 }
